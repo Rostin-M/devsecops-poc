@@ -1,0 +1,147 @@
+name: DevSecOps pipeline
+
+# Se ejecuta en cada push a main, en cada pull request y a mano desde la pestaña Actions.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Mínimo privilegio: el token del workflow solo puede leer el repositorio.
+permissions:
+  contents: read
+
+# Si llega un commit nuevo a la misma rama, cancela la ejecución anterior.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Versiones y huellas SHA-256 fijadas en el repositorio. Si alguien cambia el binario
+  # en el servidor de descargas, la verificación falla y el pipeline se detiene.
+  # Lección del ataque a Trivy de marzo de 2026: durante unas 12 horas, 76 de las 77 etiquetas de
+  # aquasecurity/trivy-action apuntaron a código que robaba secretos del runner. Por eso este workflow
+  # no usa trivy-action: instala una versión concreta del binario y comprueba su huella.
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  TRIVY_VERSION: "0.76.1"
+  TRIVY_SHA256: "c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0"
+  # Espejo de la base de vulnerabilidades de Trivy; evita el límite de descargas de ghcr.io.
+  TRIVY_DB_REPOSITORY: "public.ecr.aws/aquasecurity/trivy-db:2"
+
+jobs:
+  security-scan:
+    name: security-scan (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      # Que las dos versiones corran siempre: una debe fallar y la otra debe pasar.
+      fail-fast: false
+      matrix:
+        target: [vulnerable-app, fixed-app]
+    env:
+      TARGET: ${{ matrix.target }}
+      RESULTS: results/${{ matrix.target }}
+
+    steps:
+      - name: Descargar el código
+        # Actions de terceros se fijan al hash completo del commit, no a una etiqueta (v7.0.1).
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0 # Gitleaks también revisa el historial de commits
+          persist-credentials: false # el token no queda guardado en .git/config
+
+      - name: Preparar Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Instalar herramientas (con verificación de huella)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin" "$RESULTS"
+          curl -fsSL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum --check --strict -
+          tar -xzf gitleaks.tgz -C "$HOME/bin" gitleaks
+          curl -fsSL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum --check --strict -
+          tar -xzf trivy.tgz -C "$HOME/bin" trivy
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          pip install --quiet semgrep==1.183.0 pip-audit==2.10.1
+
+      # Cada escáner guarda su resultado y no detiene el job: así se ven todos los hallazgos.
+      # La decisión de aprobar o rechazar la toma el quality gate al final.
+
+      - name: 1. Secretos (Gitleaks)
+        continue-on-error: true
+        run: |
+          bash scripts/timed.sh gitleaks gitleaks dir "$TARGET" --no-banner --redact \
+            --report-format json --report-path "$RESULTS/gitleaks.json" --exit-code 0
+
+      - name: 2. Código (SAST con Semgrep)
+        continue-on-error: true
+        run: |
+          bash scripts/timed.sh semgrep semgrep scan --metrics=off --quiet --disable-version-check \
+            --config semgrep-rules/ --json --output "$RESULTS/semgrep.json" "$TARGET"
+
+      - name: 3. Dependencias (SCA con pip-audit)
+        continue-on-error: true
+        run: |
+          bash scripts/timed.sh pip-audit pip-audit -r "$TARGET/requirements.txt" --no-deps --disable-pip \
+            -f json -o "$RESULTS/pip-audit.json" || true
+
+      - name: 4. Dockerfile (Trivy config) y SBOM
+        continue-on-error: true
+        run: |
+          bash scripts/timed.sh trivy-config trivy config --quiet --format json --output "$RESULTS/trivy-config.json" "$TARGET"
+          trivy fs --quiet --format cyclonedx --output "$RESULTS/sbom.cdx.json" "$TARGET"
+
+      - name: 5. Construir la imagen
+        run: docker build -t poc-app:ci "$TARGET"
+
+      - name: "6. Imagen (Trivy, CVE HIGH y CRITICAL con parche)"
+        continue-on-error: true
+        # --ignore-unfixed: el gate solo bloquea por CVE que ya tienen corrección disponible.
+        # Los que aún no tienen parche no se pueden resolver desde el proyecto y bloquearían siempre.
+        # Sin --quiet para que el log muestre la causa si falla; un reintento cubre fallos de red
+        # al bajar la base de datos. Si no queda reporte, el paso falla y el gate lo nota.
+        run: |
+          rm -f "$RESULTS/trivy-image.json"
+          for intento in 1 2; do
+            bash scripts/timed.sh trivy-image trivy image --no-progress --timeout 15m \
+              --severity HIGH,CRITICAL --ignore-unfixed \
+              --format json --output "$RESULTS/trivy-image.json" poc-app:ci && break
+            echo "Trivy falló en el intento $intento; espero 20 s y reintento"
+            sleep 20
+          done
+          test -s "$RESULTS/trivy-image.json"
+
+      - name: 7. Levantar la app para el análisis dinámico
+        run: |
+          docker run -d --name poc -p 8080:8080 poc-app:ci
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:8080/ >/dev/null && exit 0
+            sleep 2
+          done
+          docker logs poc
+          exit 1
+
+      - name: 8. Aplicación en ejecución (DAST con OWASP ZAP baseline)
+        continue-on-error: true
+        run: |
+          chmod -R a+w "$RESULTS"   # el contenedor de ZAP escribe como otro usuario
+          bash scripts/timed.sh zap docker run --rm --network host -v "$PWD/$RESULTS:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t http://localhost:8080 -J zap.json -r zap.html -I
+
+      - name: Guardar reportes
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: results-${{ matrix.target }}
+          path: results/${{ matrix.target }}
+
+      - name: Quality gate
+        run: |
+          python3 scripts/summarize.py "$RESULTS" --target "$TARGET" --fail-on-findings \
+            --require gitleaks,semgrep,pip-audit,trivy-config,trivy-image,zap

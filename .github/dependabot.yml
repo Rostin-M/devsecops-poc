@@ -1,0 +1,11 @@
+# Dependabot mantiene al día los hashes fijados de las actions y las dependencias de la app corregida.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "pip"
+    directory: "/fixed-app"
+    schedule:
+      interval: "weekly"

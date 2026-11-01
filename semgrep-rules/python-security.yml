@@ -1,0 +1,88 @@
+rules:
+  - id: poc-sql-injection-fstring
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Consulta SQL armada con f-string o concatenación. Usa parámetros (?) en execute().
+    metadata:
+      cwe: "CWE-89: SQL Injection"
+      owasp: "A03:2021 Injection"
+    patterns:
+      - pattern-either:
+          - pattern: $DB.execute(f"...")
+          - pattern: |
+              $Q = f"...{$X}..."
+              ...
+              $DB.execute($Q)
+          - pattern: $DB.execute("..." + $X)
+          - pattern: $DB.execute("..." % $X)
+
+  - id: poc-eval-user-input
+    languages: [python]
+    severity: ERROR
+    message: eval() ejecuta código arbitrario. Usa ast.literal_eval o un parser propio.
+    metadata:
+      cwe: "CWE-95: Eval Injection"
+      owasp: "A03:2021 Injection"
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: poc-yaml-unsafe-load
+    languages: [python]
+    severity: ERROR
+    message: yaml.load con un Loader completo es inseguro. Usa yaml.safe_load.
+    metadata:
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      owasp: "A08:2021 Software and Data Integrity Failures"
+    pattern-either:
+      - pattern: yaml.load(..., Loader=yaml.Loader)
+      - pattern: yaml.load(..., Loader=yaml.UnsafeLoader)
+      - pattern: yaml.load(..., Loader=yaml.FullLoader)
+      - pattern: yaml.load($X)
+
+  - id: poc-subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: shell=True permite inyección de comandos. Pasa una lista de argumentos sin shell.
+    metadata:
+      cwe: "CWE-78: OS Command Injection"
+      owasp: "A03:2021 Injection"
+    pattern-either:
+      - pattern: subprocess.run(..., shell=True, ...)
+      - pattern: subprocess.call(..., shell=True, ...)
+      - pattern: subprocess.Popen(..., shell=True, ...)
+      - pattern: os.system(...)
+
+  - id: poc-weak-hash-md5-sha1
+    languages: [python]
+    severity: WARNING
+    message: MD5 y SHA-1 no son aptos para contraseñas. Usa scrypt, bcrypt o argon2.
+    metadata:
+      cwe: "CWE-327: Use of a Broken or Risky Cryptographic Algorithm"
+      owasp: "A02:2021 Cryptographic Failures"
+    pattern-either:
+      - pattern: hashlib.md5(...)
+      - pattern: hashlib.sha1(...)
+
+  - id: poc-flask-debug-true
+    languages: [python]
+    severity: ERROR
+    message: debug=True expone la consola de Werkzeug. Desactívalo fuera de desarrollo.
+    metadata:
+      cwe: "CWE-489: Active Debug Code"
+      owasp: "A05:2021 Security Misconfiguration"
+    pattern: $APP.run(..., debug=True, ...)
+
+  - id: poc-hardcoded-secret-name
+    languages: [python]
+    severity: WARNING
+    message: Posible secreto escrito en el código. Léelo de una variable de entorno o un gestor de secretos.
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 Identification and Authentication Failures"
+    patterns:
+      - pattern: $NAME = "..."
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(password|passwd|secret|api_?key|token).*
